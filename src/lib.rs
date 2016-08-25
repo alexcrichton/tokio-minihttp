@@ -1,9 +1,11 @@
+extern crate bytes;
+extern crate futures;
+extern crate futures_io;
+extern crate futures_mio;
+extern crate httparse;
+extern crate time;
 extern crate tokio;
 extern crate tokio_ssl;
-extern crate futures;
-extern crate bytes;
-extern crate time;
-extern crate httparse;
 
 mod date;
 mod request;
@@ -14,15 +16,16 @@ pub use request::Request;
 pub use response::Response;
 pub use ssl::NewSslContext;
 
-use tokio::{server, Service, NewService};
-use tokio::io::Framed;
-use tokio::proto::pipeline;
-use tokio::reactor::Reactor;
-use tokio::util::future::Empty;
-use futures::{Future, Map};
-use bytes::BlockBuf;
 use std::io;
 use std::net::SocketAddr;
+
+use bytes::BlockBuf;
+use futures::stream::Receiver;
+use futures::{Future, Map};
+use futures_mio::Loop;
+use tokio::io::Framed;
+use tokio::proto::pipeline;
+use tokio::{server, Service, NewService};
 
 pub struct Server {
     addr: SocketAddr,
@@ -50,12 +53,11 @@ impl Server {
     pub fn serve<T>(self, new_service: T)
         where T: NewService<Req = Request, Resp = Response, Error = io::Error> + Send + 'static
     {
-        let reactor = Reactor::default().unwrap();
-        let handle = reactor.handle();
+        let mut lp = Loop::new().unwrap();
         let addr = self.addr;
         let ssl = self.ssl;
 
-        server::listen(&handle, addr, move |socket| {
+        let srv = server::listen(lp.handle(), addr, move |socket| {
             // Create the service
             let service = try!(new_service.new_service());
             let service = HttpService { inner: service };
@@ -76,9 +78,8 @@ impl Server {
 
             // Return the pipeline server task
             pipeline::Server::new(service, transport)
-        }).unwrap();
-
-        reactor.run().unwrap();
+        });
+        lp.run(srv.and_then(|_| futures::empty::<(), _>())).unwrap();
     }
 }
 
@@ -99,9 +100,9 @@ impl<T> Service for HttpService<T>
     where T: Service<Req = Request, Resp = Response, Error = io::Error>,
 {
     type Req = Request;
-    type Resp = pipeline::Message<Response, Empty<(), io::Error>>;
+    type Resp = pipeline::Message<Response, Receiver<(), io::Error>>;
     type Error = io::Error;
-    type Fut = Map<T::Fut, fn(Response) -> pipeline::Message<Response, Empty<(), io::Error>>>;
+    type Fut = Map<T::Fut, fn(Response) -> pipeline::Message<Response, Receiver<(), io::Error>>>;
 
     fn call(&self, req: Request) -> Self::Fut {
         self.inner.call(req).map(pipeline::Message::WithoutBody)
